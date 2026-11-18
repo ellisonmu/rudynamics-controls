@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Leg Manual Control</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <span class="brand">Leg Control</span>
+    <nav>
+      <a href="/manual" class="active">Manual</a>
+      <a href="/moves">Moves</a>
+    </nav>
+    <span class="spacer"></span>
+    <div class="controls">
+      <button id="btn-calibrate">Calibrate</button>
+      <button id="btn-clear" style="display:none">Clear fault</button>
+      <button id="btn-disable">Disable</button>
+      <button id="btn-enable" class="primary">Enable</button>
+      <button id="btn-estop" class="estop" title="Space bar">E-STOP</button>
+    </div>
+  </header>
+  <div class="status">
+    <span id="mode-chip" class="chip">offline</span>
+    <span id="status-msg"></span>
+    <span class="spacer"></span>
+    <span id="calib"></span> · loop <span id="loop-hz" class="mono">--</span>
+  </div>
+
+  <main>
+    <section>
+      <div class="card">
+        <h2>Joints</h2>
+        <div id="joints"></div>
+        <p class="hint">Drag to set a target; the motor follows at a limited speed. Green tick = measured position. <kbd>Space</kbd> = E-STOP.</p>
+      </div>
+      <div class="card">
+        <h2>Stiffness</h2>
+        <div class="param">
+          <div class="param-head"><span>kp (stiffness)</span><span id="kp-val">--</span></div>
+          <input type="range" id="kp" min="0" max="50" step="0.5">
+        </div>
+        <div class="param">
+          <div class="param-head"><span>kd (damping)</span><span id="kd-val">--</span></div>
+          <input type="range" id="kd" min="0" max="3" step="0.05">
+        </div>
+        <div class="param">
+          <div class="param-head"><span>Max speed (how fast joints follow the sliders)</span><span id="slew-val">--</span></div>
+          <input type="range" id="slew" min="0.5" max="10" step="0.5">
+        </div>
+        <button id="btn-snap">Set targets to current pose</button>
+      </div>
+    </section>
+
+    <aside>
+      <div class="card">
+        <h2>Leg</h2>
+        <div class="views">
+          <div class="view"><div class="view-label">Side · front →</div><svg id="side"></svg></div>
+          <div class="view"><div class="view-label">Front · ← left</div><svg id="front"></svg></div>
+        </div>
+        <div class="legend">
+          <span><i style="background:var(--accent)"></i>measured</span>
+          <span><i style="background:var(--ghost)"></i>commanded</span>
+        </div>
+        <div class="footpos" id="footpos">foot: --</div>
+      </div>
+    </aside>
+  </main>
+  <div id="toast" class="toast"></div>
+
+  <script src="/panel.js"></script>
+  <script>
+    const { api, deg, rad, fmt } = Panel;
+    let joints = [];          // [{name, slider, marker, ...}]
+    let views = null;
+    let lastEdit = 0;         // ms timestamp of the last local slider change
+    let sendTimer = null;
+    let enabled = false;
+
+    function buildJoints(cfg) {
+      const box = document.getElementById("joints");
+      box.innerHTML = "";
+      joints = cfg.joints.map((j, i) => {
+        const el = document.createElement("div");
+        el.className = "joint";
+        el.innerHTML = `
+          <div class="joint-head">
+            <span class="joint-name">${j.name}<small>id ${j.id}</small></span>
+            <span class="big" data-k="target">--</span>
+          </div>
+          <div class="readouts">
+            <span>measured <b data-k="q">--</b>°</span>
+            <span>vel <b data-k="dq">--</b> rad/s</span>
+            <span>torque <b data-k="tau">--</b> Nm</span>
+            <span>temp <b data-k="temp">--</b> °C</span>
+          </div>
+          <div class="slider-wrap">
+            <div class="measured-marker"></div>
+            <input type="range" min="${deg(j.min)}" max="${deg(j.max)}" step="0.5" disabled>
+          </div>
+          <div class="range-labels"><span>${fmt(deg(j.min), 0)}°</span><span>${fmt(deg(j.max), 0)}°</span></div>`;
+        box.appendChild(el);
+        const slider = el.querySelector("input");
+        slider.addEventListener("input", () => {
+          lastEdit = Date.now();
+          el.querySelector('[data-k="target"]').textContent = `${fmt(+slider.value)}°`;
+          scheduleSend();
+        });
+        const field = (k) => el.querySelector(`[data-k="${k}"]`);
+        return { ...j, el, slider, marker: el.querySelector(".measured-marker"), field };
+      });
+    }
+
+    function scheduleSend() {
+      if (sendTimer) return;
+      sendTimer = setTimeout(() => {
+        sendTimer = null;
+        api("/api/manual", { q: joints.map((j) => rad(+j.slider.value)) });
+      }, 50);
+    }
+
+    function render(s) {
+      enabled = !!s && (s.mode === "manual" || s.mode === "motion");
+      const editing = Date.now() - lastEdit < 500;
+      if (!s) return;
+      s.joints.forEach((js, i) => {
+        const j = joints[i];
+        if (!j) return;
+        j.slider.disabled = !enabled;
+        j.field("q").textContent = js.q == null ? "--" : fmt(deg(js.q));
+        j.field("dq").textContent = fmt(js.dq, 2);
+        j.field("tau").textContent = fmt(js.tau, 2);
+        j.field("temp").textContent = js.temp == null ? "--" : js.temp;
+        // slider follows the server unless the user is dragging it
+        const follow = enabled ? (s.mode === "motion" ? js.cmd : js.target) : js.q;
+        if (!editing && follow != null) {
+          j.slider.value = deg(follow);
+          j.field("target").textContent = enabled ? `${fmt(deg(follow))}°` : "--";
+        }
+        if (js.q != null) {
+          const f = (js.q - j.min) / (j.max - j.min);
+          j.marker.style.left = `calc(10px + ${Math.max(0, Math.min(1, f))} * (100% - 20px))`;
+        }
+      });
+      if (document.activeElement.id !== "kp") {
+        document.getElementById("kp").value = s.kp;
+      }
+      if (document.activeElement.id !== "kd") {
+        document.getElementById("kd").value = s.kd;
+      }
+      if (document.activeElement.id !== "slew") {
+        document.getElementById("slew").value = s.slew;
+      }
+      document.getElementById("slew-val").textContent = `${fmt(s.slew)} rad/s`;
+      document.getElementById("kp-val").textContent = fmt(s.kp);
+      document.getElementById("kd-val").textContent = fmt(s.kd, 2);
+      if (views) {
+        Panel.drawLeg(views.side, "side", s);
+        Panel.drawLeg(views.front, "front", s);
+      }
+      document.getElementById("footpos").textContent = Panel.footText(s);
+    }
+
+    for (const k of ["kp", "kd", "slew"]) {
+      document.getElementById(k).addEventListener("change", (e) => api("/api/gains", { [k]: +e.target.value }));
+      document.getElementById(k).addEventListener("input", (e) => {
+        const v = +e.target.value;
+        document.getElementById(`${k}-val`).textContent = k === "slew" ? `${v.toFixed(1)} rad/s` : v.toFixed(k === "kp" ? 1 : 2);
+      });
+    }
+    document.getElementById("btn-snap").addEventListener("click", async () => {
+      const s = await api("/api/state");
+      if (s && s.joints.every((j) => j.q != null)) {
+        api("/api/manual", { q: s.joints.map((j) => j.q) });
+      }
+    });
+
+    Panel.start({
+      onConfig(cfg) {
+        buildJoints(cfg);
+        views = {
+          side: Panel.makeView(document.getElementById("side"), cfg.geometry),
+          front: Panel.makeView(document.getElementById("front"), cfg.geometry),
+        };
+      },
+      onState: render,
+    });
+  </script>
+</body>
+</html>
